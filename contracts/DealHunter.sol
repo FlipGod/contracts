@@ -28,6 +28,14 @@ interface IMarketAdapter {
     ) external;
 }
 
+interface IERC721 {
+    function safeTransferFrom(
+        address _from,
+        address _to,
+        uint256 _tokenId
+    ) external payable;
+}
+
 interface IDownPayment {
     function buy(
         address adapter,
@@ -40,12 +48,40 @@ interface IDownPayment {
 contract DealHunter {
     using LowGasSafeMath for uint256;
 
-    address public wethAddress;
-    uint256 public downpaymentRate;
+    event FullPaymentSuccessful(
+        address collection,
+        uint256 tokenId,
+        address buyer,
+        uint256 price
+    );
 
-    constructor(address _wethAddress, uint256 _downpaymentRate) {
+    event DownPaymentSuccessful(
+        address collection,
+        uint256 tokenId,
+        address buyer,
+        uint256 price
+    );
+
+    address public wethAddress;
+    address public lenderAddress;
+    uint256 public downPaymentRate;
+
+    constructor(
+        address _wethAddress,
+        address _lenderAddress,
+        uint256 _downPaymentRate
+    ) {
         wethAddress = _wethAddress;
-        downpaymentRate = _downpaymentRate;
+        lenderAddress = lenderAddress;
+        downPaymentRate = _downPaymentRate;
+    }
+
+    function setDownpaymentRate(uint256 rate) external {
+        downPaymentRate = rate;
+    }
+
+    function setLenderAddress(address _lenderAddress) external {
+        lenderAddress = _lenderAddress;
     }
 
     function fire(
@@ -54,12 +90,12 @@ contract DealHunter {
         uint256 tokenId,
         address buyer,
         uint256 price,
-        bool downpayment,
+        bool downPayment,
         bytes calldata data
     ) external {
         uint256 _requiredBalence = price;
-        if (downpayment) {
-            _requiredBalence = LowGasSafeMath.mul(price, downpaymentRate) / 100;
+        if (downPayment) {
+            _requiredBalence = LowGasSafeMath.mul(price, downPaymentRate) / 100;
         }
         require(
             buyer.balance >= _requiredBalence,
@@ -81,21 +117,23 @@ contract DealHunter {
 
         IWETH(wethAddress).withdraw(price);
 
-        if (!downpayment) {
+        if (!downPayment) {
             IMarketAdapter(marketAdapter).purchaseNFT(
                 collection,
                 tokenId,
                 data
             );
 
-            // TODO: transfer to buyer below or has been done by above purchaseNFT
+            IERC721(collection).safeTransferFrom(address(this), buyer, tokenId);
+            emit FullPaymentSuccessful(collection, tokenId, buyer, price);
         } else {
-            IDownPayment(marketAdapter).buy(
+            IDownPayment(lenderAddress).buy(
                 marketAdapter,
                 LowGasSafeMath.sub(price, _requiredBalence),
                 data,
                 sig
             );
+            emit DownPaymentSuccessful(collection, tokenId, buyer, price);
         }
     }
 }
