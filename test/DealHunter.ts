@@ -6,13 +6,20 @@ import { anyValue } from "@nomicfoundation/hardhat-chai-matchers/withArgs";
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { createSignedFlashloanParams } from "./helper/opensea";
+import { IERC721 } from "../typechain-types/@openzeppelin/contracts/token/ERC721/IERC721";
 
 const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 
 const WETHAddress = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
 const DownPaymentAddress = '0x3710D54de90324C8BA4B534D1e3F0fCEDc679ca4';
 const DbetWETHAddress = '0x87ddE3A3f4b629E389ce5894c9A1F34A7eeC5648';
-const DownPaymentRatio = 4200;
+const LendPoolProviderAddress = '0x24451f47caf13b24f4b5034e1df6c0e401ec0e46';
+const downPaymentFeeRetio = 200;
+
+const bnftMapping = {
+  "0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d": "0xDBfD76AF2157Dc15eE4e57F3f942bB45Ba84aF24",
+}
+
 const paymentCases = {
   opensea: {
     orderInput: {
@@ -67,36 +74,53 @@ describe("DealHunter", function () {
     const calldataPlaceholder = abiCoder.encode(['uint256'], [0]);
 
     const DH = await ethers.getContractFactory("DealHunter");
-    const dh = await DH.deploy(WETHAddress, DbetWETHAddress, DownPaymentAddress, DownPaymentRatio);
-    const weth = await ethers.getContractAt('IWETH', WETHAddress);
-    const dp = await ethers.getContractAt('IDownpayment', DownPaymentAddress);
-    const bendAddressesProvider = await ethers.getContractAt("ILendPoolAddressesProvider", "0x24451f47caf13b24f4b5034e1df6c0e401ec0e46");
-    const bendLendPool = await ethers.getContractAt("ILendPool", await bendAddressesProvider.getLendPool());
+    const dh = await DH.deploy();
+    await dh.initialize(WETHAddress, DbetWETHAddress, DownPaymentAddress, LendPoolProviderAddress, downPaymentFeeRetio);
 
+    const weth = await ethers.getContractAt('IWETH', WETHAddress);
     await weth.connect(wethProvider).transfer(buyer, await weth.balanceOf(wethProvider));
 
-    console.log(`WETH Buyer balance ${buyer.address}: ${await weth.balanceOf(buyer)}`);
+    const dWeth = await ethers.getContractAt("IDebtToken", DbetWETHAddress);
 
-    return { dh, weth, dp, bendLendPool, owner, otherAccount, buyer, addressPlaceholder, calldataPlaceholder };
+    const dp = await ethers.getContractAt('IDownpayment', DownPaymentAddress);
+
+    const bendAddressesProvider = await ethers.getContractAt("ILendPoolAddressesProvider", LendPoolProviderAddress);
+    const bendLendPool = await ethers.getContractAt("ILendPool", await bendAddressesProvider.getLendPool());
+
+    const bnftContracts: { [index: string]: IERC721 } = {};
+    for (const item of Object.entries(bnftMapping)) {
+      bnftContracts[item[0]] = await ethers.getContractAt("IERC721", item[1]);
+    }
+
+    const nftContracts: { [index: string]: IERC721 } = {};
+    for (const item of Object.entries(bnftMapping)) {
+      nftContracts[item[0]] = await ethers.getContractAt("IERC721", item[0]);
+    }
+
+    console.log(`WETH Buyer balance ${buyer.address}: ${await weth.balanceOf(buyer)}`);
+    console.log(`DH Contract Address ${await dh.getAddress()}`);
+    console.log(`DH Contract Owner Address ${owner.address}`);
+
+    return { dh, weth, dWeth, dp, bendLendPool, bnftContracts, nftContracts, owner, otherAccount, buyer, addressPlaceholder, calldataPlaceholder };
   }
 
   describe("Deployment", function () {
     it("Should set the right WETH contract address", async function () {
       const { dh } = await loadFixture(deployDHFixture);
 
-      expect(await dh.wethAddress()).to.equal(WETHAddress);
+      expect(await dh.weth()).to.equal(WETHAddress);
     });
 
     it("Should set the right DownPayment contract address", async function () {
       const { dh } = await loadFixture(deployDHFixture);
 
-      expect(await dh.lenderAddress()).to.equal(DownPaymentAddress);
+      expect(await dh.lender()).to.equal(DownPaymentAddress);
     });
 
     it("Should set the right DownPaymentRate ", async function () {
       const { dh } = await loadFixture(deployDHFixture);
 
-      expect(await dh.downPaymentRatio()).to.equal(DownPaymentRatio);
+      expect(await dh.downPaymentFeeRetio()).to.equal(downPaymentFeeRetio);
     });
   });
 
@@ -230,47 +254,86 @@ describe("DealHunter", function () {
     });
 
     describe("Down Payment", function () {
-      it("Should buyer reveiced NFT that they bought with 42% down payment", async function () {
-        const { dh, weth, dp, bendLendPool, owner, buyer } = await loadFixture(deployDHFixture);
+      it("Should reveiced BoundNFT on contract address", async function () {
+        const { dh, weth, dp, bnftContracts, owner, buyer } = await loadFixture(deployDHFixture);
 
         await weth.connect(buyer).approve(
-          await paymentCases.opensea.adapterDownPayment,
-          // ethers.parseEther((Number(paymentCases.opensea.price) * 0.42).toString())
-          await weth.balanceOf(buyer.address)
+          await dh.getAddress(),
+          ethers.parseEther(paymentCases.opensea.price)
         );
 
         const signedParams = await createSignedFlashloanParams(
-          1,
-          buyer,
+          1n,
+          owner,
           paymentCases.opensea.adapterDownPayment,
           paymentCases.opensea.orderInput,
-          await dp.nonces(buyer.address),
-        );
-        const borrowAmount = await bendLendPool.getNftCollateralData(
-          paymentCases.opensea.nftContract.address,
-          WETHAddress,
+          await dp.nonces(owner.address),
         );
 
-        console.log(signedParams, borrowAmount.availableBorrowsInReserve);
-
-        await dp.connect(buyer).buy(
+        await dh.connect(owner).fire(
           paymentCases.opensea.adapterDownPayment,
-          borrowAmount.availableBorrowsInReserve,
+          paymentCases.opensea.nftContract.address,
+          BigInt(paymentCases.opensea.tokenId),
+          buyer.address,
+          ethers.parseEther(paymentCases.opensea.price),
+          true,
           signedParams.data,
           signedParams.sig
-        )
+        );
 
-        // await dh.connect(owner).fire(
-        //   paymentCases.opensea.adapterDownPayment,
-        //   paymentCases.opensea.nftContract.address,
-        //   BigInt(paymentCases.opensea.tokenId),
-        //   buyer.address,
-        //   ethers.parseEther('100'),
-        //   borrowAmount.availableBorrowsInReserve,
-        //   true,
-        //   signedParams.data,
-        //   signedParams.sig
-        // );
+        const bnft = bnftContracts[paymentCases.opensea.nftContract.address];
+        expect(await bnft.ownerOf(paymentCases.opensea.tokenId))
+          .to.be.equal(await dh.getAddress());
+      });
+
+      it("Should buyer reveiced NFT when loan repaid", async function () {
+        const { dh, weth, dp, bendLendPool, bnftContracts, nftContracts, owner, buyer } = await loadFixture(deployDHFixture);
+
+        await weth.connect(buyer).approve(
+          await dh.getAddress(),
+          // approved 103% of price amount for fee and repay
+          ethers.parseEther((Number(paymentCases.opensea.price) * 1.03).toString())
+        );
+
+        const borrowAmount = await bendLendPool.getNftCollateralData(
+          paymentCases.opensea.nftContract.address,
+          WETHAddress
+        );
+
+        const signedParams = await createSignedFlashloanParams(
+          1n,
+          owner,
+          paymentCases.opensea.adapterDownPayment,
+          paymentCases.opensea.orderInput,
+          await dp.nonces(owner.address),
+        );
+
+        await dh.connect(owner).fire(
+          paymentCases.opensea.adapterDownPayment,
+          paymentCases.opensea.nftContract.address,
+          BigInt(paymentCases.opensea.tokenId),
+          buyer.address,
+          ethers.parseEther(paymentCases.opensea.price),
+          true,
+          signedParams.data,
+          signedParams.sig
+        );
+
+        const bnft = bnftContracts[paymentCases.opensea.nftContract.address];
+        expect(await bnft.ownerOf(paymentCases.opensea.tokenId))
+          .to.be.equal(await dh.getAddress());
+
+        console.log("buyer weth balance:", await weth.balanceOf(buyer.address));
+
+         await dh.connect(buyer).repay(
+          paymentCases.opensea.nftContract.address,
+          paymentCases.opensea.tokenId,
+          BigInt(Number(borrowAmount.availableBorrowsInReserve) * 1.01)
+        );
+
+        expect(await nftContracts[paymentCases.opensea.nftContract.address]
+          .ownerOf(paymentCases.opensea.tokenId)).to.be.equal(buyer.address);
+
       });
     });
 
